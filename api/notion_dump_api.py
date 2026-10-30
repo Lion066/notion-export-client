@@ -3,6 +3,7 @@
 # mail:geniusrabbit@qq.com
 
 import copy
+import filecmp
 import os
 import shutil
 import json
@@ -17,6 +18,8 @@ KERNEL_VERSION = NotionDump.__version__
 CHILD_PAGES_PATH = "./child_pages/"
 DATABASE_PATH = "./databases/"
 FILES_PATH = "./files/"
+# 导出暂存目录（位于缓存目录下）
+STAGING_PATH = "export_staging"
 DB_INSERT_TYPE_LINK = 0
 DB_INSERT_TYPE_PAGE = 1
 
@@ -249,6 +252,29 @@ class NotionDumpApi:
             self.show_log("main page:" + self.__page_id + " not export success", level=LOG_INFO)
             return False
 
+        # 先导出到暂存目录，完成后再增量同步到备份目录（只写入有变化的文件）
+        real_dump_path = self.__dump_path
+        staging_root = os.path.normpath(NotionDump.TMP_DIR + "/" + STAGING_PATH)
+        if os.path.exists(staging_root):
+            shutil.rmtree(staging_root)
+        self.__dump_path = os.path.normpath(staging_root + "/" + os.path.basename(os.path.normpath(real_dump_path))) + "/"
+        try:
+            self.__export_to_dump_path(page_detail_json)
+            copy_count, remove_count = self.__sync_dir(self.__dump_path, real_dump_path)
+            self.show_log("sync to " + real_dump_path + ", update " + str(copy_count) + " files, remove "
+                          + str(remove_count) + " items", level=LOG_INFO)
+        finally:
+            self.__dump_path = real_dump_path
+        shutil.rmtree(staging_root, ignore_errors=True)
+        self.show_log("file link relocate success, check path :" + self.__dump_path, level=LOG_INFO)
+
+        # 显示kernel中出现的错误
+        if "errors" in page_detail_json and len(page_detail_json["errors"]) > 0:
+            self.show_log("kernel dump error list:", level=LOG_INFO)
+            self.show_log(page_detail_json["errors"], level=LOG_INFO)
+        return True
+
+    def __export_to_dump_path(self, page_detail_json):
         # 生成文件目录
         self.__gen_dir()
         main_page_list = [self.__page_id]
@@ -276,13 +302,35 @@ class NotionDumpApi:
             self.show_log("convert db link to content...", level=LOG_INFO)
             self.__relocate_db()
             self.after_export_process()
-        self.show_log("file link relocate success, check path :" + self.__dump_path, level=LOG_INFO)
 
-        # 显示kernel中出现的错误
-        if "errors" in page_detail_json and len(page_detail_json["errors"]) > 0:
-            self.show_log("kernel dump error list:", level=LOG_INFO)
-            self.show_log(page_detail_json["errors"], level=LOG_INFO)
-        return True
+    # 将暂存目录同步到备份目录：只复制新增或内容变化的文件，删除已不存在的文件（保留.开头的文件，如.obsidian）
+    def __sync_dir(self, src_dir, des_dir):
+        copy_count = 0
+        remove_count = 0
+        if not os.path.exists(des_dir):
+            os.makedirs(des_dir)
+        src_names = set(os.listdir(src_dir))
+        for name in os.listdir(des_dir):
+            des_name = os.path.join(des_dir, name)
+            if name.startswith("."):
+                continue
+            if name not in src_names or os.path.isdir(des_name) != os.path.isdir(os.path.join(src_dir, name)):
+                if os.path.isdir(des_name):
+                    shutil.rmtree(des_name)
+                else:
+                    os.remove(des_name)
+                remove_count += 1
+        for name in src_names:
+            src_name = os.path.join(src_dir, name)
+            des_name = os.path.join(des_dir, name)
+            if os.path.isdir(src_name):
+                c, r = self.__sync_dir(src_name, des_name)
+                copy_count += c
+                remove_count += r
+            elif not os.path.exists(des_name) or not filecmp.cmp(src_name, des_name, shallow=True):
+                shutil.copy2(src_name, des_name)
+                copy_count += 1
+        return copy_count, remove_count
 
     # 创建文件目录
     def __gen_dir(self):
@@ -328,6 +376,24 @@ class NotionDumpApi:
         for line in all_lines:
             line = line.replace(src_str, des_str)
             file.writelines(line)
+        file.close()
+
+    # 一次读写完成文件中的多个链接替换（按顺序替换，与逐个调用__relocate_link结果一致）
+    def __relocate_links(self, file_name, link_pairs):
+        if len(link_pairs) == 0:
+            return
+        if file_name is None or file_name == "" or not os.path.exists(file_name):
+            for src_str, des_str in link_pairs:
+                self.show_log("[ERROR] relocate " + src_str + " -> " + des_str + ", filename [" + str(file_name) + "] not exist!", level=LOG_INFO)
+            return
+        file = open(file_name, 'r', encoding='utf-8')
+        content = file.read()
+        file.close()
+        for src_str, des_str in link_pairs:
+            self.show_log("@ in file:" + file_name + " " + src_str + " -> " + des_str, level=LOG_INFO)
+            content = content.replace(src_str, des_str)
+        file = open(file_name, 'w+', encoding='utf-8')
+        file.write(content)
         file.close()
 
     def __find_true_id(self, pages_handle, page_id):
@@ -567,6 +633,7 @@ class NotionDumpApi:
 
             # 开始处理该页面下的所有链接，并将主页中的内容重定位
             # 获取到所有的子页面id 将主页中的子页面进行重定位，获取实际链接
+            relocate_pairs = []
             for child_id in page_info["child_pages"]:  # 改为逆序遍历
                 # 如果是子id是主页面包含的数据库，给子页面添加 额外的标志位
                 # if self.__db_parser_type == NotionDump.PARSER_TYPE_MD \
@@ -587,7 +654,14 @@ class NotionDumpApi:
                 if child_os_path != "" and copy_flag and child_dump_path != "" and os.path.exists(child_dump_path):
                     self.show_log("% __relocate_child_page copy " + child_dump_path + " to " + child_os_path,
                                   level=LOG_INFO)
-                    shutil.copyfile(child_dump_path, child_os_path)
+                    if pages_handle[child_id]["type"] == "image" or pages_handle[child_id]["type"] == "file":
+                        # 图片和文件不会被修改，用硬链接代替复制，同时保留原文件的修改时间便于同步时比较
+                        try:
+                            os.link(child_dump_path, child_os_path)
+                        except OSError:
+                            shutil.copy2(child_dump_path, child_os_path)
+                    else:
+                        shutil.copyfile(child_dump_path, child_os_path)
 
                 # 重定位主页中的链接
                 src_link = "[" + child_id + "]()"
@@ -609,7 +683,7 @@ class NotionDumpApi:
                         des_link = child_name
                 self.show_log("% __relocate_link file " + root_os_path + ", from " + src_link + " to " + des_link,
                               level=LOG_INFO)
-                self.__relocate_link(root_os_path, src_link, des_link)
+                relocate_pairs.append((src_link, des_link))
 
                 # # 测试
                 # if page_id == '7aa4cf88047642208064adc76290a285':
@@ -636,6 +710,7 @@ class NotionDumpApi:
 
             if root_md is not None:
                 root_md.close()
+            self.__relocate_links(root_os_path, relocate_pairs)
 
             # 递归处理子页面,链接页面不会递归
             self.__relocate_child_page(pages_handle, page_info["child_pages"])
