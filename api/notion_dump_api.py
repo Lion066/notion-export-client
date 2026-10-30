@@ -3,6 +3,7 @@
 # mail:geniusrabbit@qq.com
 
 import copy
+import datetime
 import filecmp
 import os
 import shutil
@@ -65,6 +66,7 @@ class NotionDumpApi:
 
         # 记录数据库插入到嵌入改数据库md文件的位置
         self.__db_relocate_dic = {}  # db_relocate_item 组成的list
+        self.__unique_names = {}  # 重名页面的导出文件名 {page_id: file_name}
         self.main_page_path = ""  # 临时保存主页路径
 
         # 日志控制
@@ -275,6 +277,7 @@ class NotionDumpApi:
         return True
 
     def __export_to_dump_path(self, page_detail_json):
+        self.__unique_names = self.__gen_unique_names(page_detail_json)
         # 生成文件目录
         self.__gen_dir()
         main_page_list = [self.__page_id]
@@ -302,6 +305,69 @@ class NotionDumpApi:
             self.show_log("convert db link to content...", level=LOG_INFO)
             self.__relocate_db()
             self.after_export_process()
+
+    # 获取页面的日期：页面最早的日期属性，没有则使用创建日期；数据库使用创建日期
+    @staticmethod
+    def __get_page_date(page_id, page_type):
+        if page_type == "page":
+            page_json = common_op.load_json_from_file(NotionDump.TMP_DIR + "retrieve_page_" + page_id + ".json")
+        elif page_type == "database":
+            page_json = common_op.load_json_from_file(NotionDump.TMP_DIR + "retrieve_db_" + page_id + ".json")
+        else:
+            return "", ""
+        if page_json is None or "created_time" not in page_json:
+            return "", ""
+        created_time = page_json["created_time"]
+        date_list = sorted(prop["date"]["start"][0:10] for prop in page_json.get("properties", {}).values()
+                           if prop.get("type") == "date" and prop.get("date") is not None)
+        if len(date_list) > 0:
+            return date_list[0], created_time
+        local_time = datetime.datetime.fromisoformat(created_time.replace("Z", "+00:00")).astimezone()
+        return local_time.strftime("%Y-%m-%d"), created_time
+
+    # 同名页面会导出到同一个文件而互相覆盖，给重名页面的文件名加上日期后缀，同一天的再加上序号
+    def __gen_unique_names(self, pages_handle):
+        name_group = {}
+        for page_id, page_info in pages_handle.items():
+            if page_id == "errors" or page_info["main_page"] or not page_info["dumped"] \
+                    or page_info["link_id"] != "" or page_info["local_path"] == "":
+                continue
+            if page_info["type"] == "page":
+                sub_dir = CHILD_PAGES_PATH
+            elif page_info["type"] == "database":
+                sub_dir = DATABASE_PATH
+            elif page_info["type"] == "image" or page_info["type"] == "file":
+                sub_dir = FILES_PATH
+            else:
+                continue
+            page_name = page_info["page_name"] if page_info["page_name"] != "" else page_id
+            file_name = self.__add_page_file_suffix(page_info, self.__get_safe_file_name(copy.deepcopy(page_name)))
+            # Windows文件名不区分大小写
+            name_group.setdefault((sub_dir, file_name.lower()), []).append((page_id, file_name))
+
+        unique_names = {}
+        for page_list in name_group.values():
+            if len(page_list) < 2:
+                continue
+            date_group = {}
+            for page_id, file_name in page_list:
+                page_date, created_time = self.__get_page_date(page_id, pages_handle[page_id]["type"])
+                date_group.setdefault(page_date, []).append((created_time, page_id, file_name))
+            for page_date, date_list in date_group.items():
+                date_list.sort()
+                for index, (created_time, page_id, file_name) in enumerate(date_list):
+                    suffix = ""
+                    if page_date != "":
+                        suffix += "_" + page_date
+                    if len(date_list) > 1:
+                        suffix += "_" + str(index + 1)
+                    dot_pos = file_name.rfind(".")
+                    if dot_pos == -1:
+                        unique_names[page_id] = file_name + suffix
+                    else:
+                        unique_names[page_id] = file_name[0:dot_pos] + suffix + file_name[dot_pos:]
+        self.show_log("rename " + str(len(unique_names)) + " pages with the same name", level=LOG_INFO)
+        return unique_names
 
     # 将暂存目录同步到备份目录：只复制新增或内容变化的文件，删除已不存在的文件（保留.开头的文件，如.obsidian）
     def __sync_dir(self, src_dir, des_dir):
@@ -463,6 +529,7 @@ class NotionDumpApi:
         # 获取页面后缀,
         page_name_suffix = self.__get_safe_file_name(copy.deepcopy(child_name))
         page_name_suffix = self.__add_page_file_suffix(child_info, page_name_suffix)
+        page_name_suffix = self.__unique_names.get(child_id, page_name_suffix)
         # 获取页面链接
         child_link = ""
         if root_main and child_main:
@@ -548,6 +615,7 @@ class NotionDumpApi:
         # 给页面加个后缀;获取安全路径
         page_name_suffix = self.__get_safe_file_name(copy.deepcopy(page_name))
         page_name_suffix = self.__add_page_file_suffix(page_info, page_name_suffix)
+        page_name_suffix = self.__unique_names.get(page_id, page_name_suffix)
 
         # 获取系统路径
         if page_info["main_page"]:
