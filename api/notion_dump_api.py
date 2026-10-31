@@ -21,7 +21,7 @@ DATABASE_PATH = "./databases/"
 FILES_PATH = "./files/"
 # 导出暂存目录（位于缓存目录下）
 STAGING_PATH = "export_staging"
-# 每次读取都会变化的公式属性（随机数、距今天数），只有这些行不同时不重写文件
+# 每次读取都会变化的公式属性/表格列（随机数、距今天数），只有这些内容不同时不重写文件
 VOLATILE_PROPERTIES = ("随机排序", "上次编辑天数")
 DB_INSERT_TYPE_LINK = 0
 DB_INSERT_TYPE_PAGE = 1
@@ -401,19 +401,40 @@ class NotionDumpApi:
                 copy_count += 1
         return copy_count, remove_count
 
-    # 判断两个md文件是否只有每次读取都会变化的公式属性行不同（这类变化不值得重写文件）
+    # 去掉md文件中每次读取都会变化的内容：页面属性里的公式行，以及表格里的公式列
     @staticmethod
-    def __only_volatile_diff(src_name, des_name):
+    def __strip_volatile(lines):
+        keys = tuple("|" + name + "|" for name in VOLATILE_PROPERTIES)
+        result = []
+        volatile_cols = []
+        col_count = 0
+        for line in lines:
+            if line.startswith(keys):
+                continue
+            if not line.startswith("|"):
+                volatile_cols = []
+            else:
+                cells = line.rstrip("\n").split("|")
+                if volatile_cols and len(cells) == col_count:
+                    line = "|".join(c for i, c in enumerate(cells) if i not in volatile_cols) + "\n"
+                else:
+                    # 含公式列的表头：记录公式列的位置，后面同一张表格的行都去掉这些列
+                    cols = [i for i, c in enumerate(cells) if c.strip() in VOLATILE_PROPERTIES]
+                    if cols:
+                        volatile_cols, col_count = cols, len(cells)
+                        line = "|".join(c for i, c in enumerate(cells) if i not in volatile_cols) + "\n"
+            result.append(line)
+        return result
+
+    # 判断两个md文件是否只有每次读取都会变化的公式内容不同（这类变化不值得重写文件）
+    def __only_volatile_diff(self, src_name, des_name):
         if not src_name.endswith(".md"):
             return False
-        keys = tuple("|" + name + "|" for name in VOLATILE_PROPERTIES)
         try:
             with open(src_name, encoding="utf-8") as f_src, open(des_name, encoding="utf-8") as f_des:
-                src_lines = [line for line in f_src if not line.startswith(keys)]
-                des_lines = [line for line in f_des if not line.startswith(keys)]
+                return self.__strip_volatile(f_src.readlines()) == self.__strip_volatile(f_des.readlines())
         except (OSError, UnicodeDecodeError):
             return False
-        return src_lines == des_lines
 
     # 创建文件目录
     def __gen_dir(self):
