@@ -21,6 +21,8 @@ DATABASE_PATH = "./databases/"
 FILES_PATH = "./files/"
 # 导出暂存目录（位于缓存目录下）
 STAGING_PATH = "export_staging"
+# 每次读取都会变化的公式属性（随机数、距今天数），只有这些行不同时不重写文件
+VOLATILE_PROPERTIES = ("随机排序", "上次编辑天数")
 DB_INSERT_TYPE_LINK = 0
 DB_INSERT_TYPE_PAGE = 1
 
@@ -393,10 +395,25 @@ class NotionDumpApi:
                 c, r = self.__sync_dir(src_name, des_name)
                 copy_count += c
                 remove_count += r
-            elif not os.path.exists(des_name) or not filecmp.cmp(src_name, des_name, shallow=True):
+            elif not os.path.exists(des_name) or not (filecmp.cmp(src_name, des_name, shallow=True)
+                                                      or self.__only_volatile_diff(src_name, des_name)):
                 shutil.copy2(src_name, des_name)
                 copy_count += 1
         return copy_count, remove_count
+
+    # 判断两个md文件是否只有每次读取都会变化的公式属性行不同（这类变化不值得重写文件）
+    @staticmethod
+    def __only_volatile_diff(src_name, des_name):
+        if not src_name.endswith(".md"):
+            return False
+        keys = tuple("|" + name + "|" for name in VOLATILE_PROPERTIES)
+        try:
+            with open(src_name, encoding="utf-8") as f_src, open(des_name, encoding="utf-8") as f_des:
+                src_lines = [line for line in f_src if not line.startswith(keys)]
+                des_lines = [line for line in f_des if not line.startswith(keys)]
+        except (OSError, UnicodeDecodeError):
+            return False
+        return src_lines == des_lines
 
     # 创建文件目录
     def __gen_dir(self):
