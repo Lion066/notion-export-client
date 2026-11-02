@@ -22,7 +22,7 @@ FILES_PATH = "./files/"
 # 导出暂存目录（位于缓存目录下）
 STAGING_PATH = "export_staging"
 # 每次读取都会变化的公式属性/表格列（随机数、距今天数），只有这些内容不同时不重写文件
-VOLATILE_PROPERTIES = ("随机排序", "上次编辑天数")
+VOLATILE_PROPERTIES = ("随机排序", "上次编辑天数", "创建天数", "任务提醒")
 DB_INSERT_TYPE_LINK = 0
 DB_INSERT_TYPE_PAGE = 1
 
